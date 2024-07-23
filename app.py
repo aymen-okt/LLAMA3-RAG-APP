@@ -9,78 +9,13 @@ import chainlit as cl
 from langdetect import detect
 import arabic_reshaper
 from bidi.algorithm import get_display
-from dotenv import load_dotenv
-import os
-import httpx
-from langchain.llms.base import LLM
-from langchain.callbacks.manager import CallbackManagerForLLMRun
-from typing import Any, List, Optional
+from langchain_community.chat_models import ChatOllama
+from unstructured.partition.pdf import partition_pdf
+import easyocr
+import numpy as np
+from PIL import Image
 
-# Load environment variables
-load_dotenv()
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')
-
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY is not set in the environment variables.")
-
-class GroqLLM(LLM):
-    model_name: str = "llama3-70b-8192"
-    temperature: float = 0.7
-    max_tokens: int = 1024
-
-    @property
-    def _llm_type(self) -> str:
-        return "groq"
-
-    def _call(
-        self,
-        prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs: Any,
-    ) -> str:
-        with httpx.Client() as client:
-            response = client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model_name,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
-                },
-                timeout=60.0
-            )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
-
-    async def _acall(
-        self,
-        prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs: Any,
-    ) -> str:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model_name,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
-                },
-                timeout=60.0
-            )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
+reader = easyocr.Reader(['ar', 'en'])  # Initialize EasyOCR reader for Arabic and English
 
 def preprocess_text(text, lang):
     lines = text.split('\n')
@@ -93,17 +28,40 @@ def preprocess_text(text, lang):
         return bidi_text
     return processed_text
 
+def split_and_process_text(text, lang):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
+    chunks = text_splitter.split_text(text)
+    
+    if lang == 'ar':
+        processed_chunks = []
+        for chunk in chunks:
+            reshaped_chunk = arabic_reshaper.reshape(chunk)
+            bidi_chunk = get_display(reshaped_chunk)
+            processed_chunks.append(bidi_chunk)
+        return processed_chunks
+    return chunks
+
 async def process_pdf(file):
     doc = fitz.open(file.path)
     pdf_text = ""
-    for page in doc:
-        pdf_text += page.get_text()
+    is_scanned = False
+
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        page_text = page.get_text()
+        
+        if not page_text.strip():
+            is_scanned = True
+            pix = page.get_pixmap()
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            img_np = np.array(img)
+            page_text = " ".join(reader.readtext(img_np, detail=0))
+        
+        pdf_text += page_text
     
     lang = detect(pdf_text)
     preprocessed_text = preprocess_text(pdf_text, lang)
-    
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    file_texts = text_splitter.split_text(preprocessed_text)
+    file_texts = split_and_process_text(preprocessed_text, lang)
     
     file_metadatas = [{"source": f"{i}-{file.name}", "lang": lang} for i in range(len(file_texts))]
     
@@ -131,7 +89,7 @@ async def on_chat_start():
         texts.extend(file_texts)
         metadatas.extend(file_metadatas)
     
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/xlm-r-100langs-bert-base-nli-stsb-mean-tokens")
     
     docsearch = Chroma.from_texts(texts, embeddings, metadatas=metadatas)
     message_history = ChatMessageHistory()
@@ -142,7 +100,7 @@ async def on_chat_start():
         return_messages=True,
     )
     chain = ConversationalRetrievalChain.from_llm(
-        GroqLLM(),
+        ChatOllama(model="qwen2:7b"),
         chain_type="stuff",
         retriever=docsearch.as_retriever(),
         memory=memory,
