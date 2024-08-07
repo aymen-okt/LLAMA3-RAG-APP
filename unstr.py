@@ -1,4 +1,3 @@
-import fitz  # PyMuPDF
 import asyncio
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -9,12 +8,8 @@ import chainlit as cl
 from langdetect import detect
 import arabic_reshaper
 from bidi.algorithm import get_display
-import easyocr
-import numpy as np
-from PIL import Image
 from langchain_community.chat_models import ChatOllama
-
-reader = easyocr.Reader(['ar', 'en'])  # Initialize EasyOCR reader for Arabic and English
+from langchain.document_loaders import UnstructuredFileLoader
 
 def preprocess_text(text, lang):
     lines = text.split('\n')
@@ -34,24 +29,14 @@ def split_and_process_text(text, lang):
         return [get_display(arabic_reshaper.reshape(chunk)) for chunk in chunks]
     return chunks
 
-async def process_pdf(file):
-    doc = fitz.open(file.path)
-    pdf_text = ""
-
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        page_text = page.get_text()
-        
-        if not page_text.strip():
-            pix = page.get_pixmap()
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            img_np = np.array(img)
-            page_text = " ".join(reader.readtext(img_np, detail=0))
-        
-        pdf_text += page_text
+async def process_file(file):
+    loader = UnstructuredFileLoader(file.path)
+    documents = loader.load()
     
-    lang = detect(pdf_text)
-    preprocessed_text = preprocess_text(pdf_text, lang)
+    file_text = " ".join([doc.page_content for doc in documents])
+    
+    lang = detect(file_text)
+    preprocessed_text = preprocess_text(file_text, lang)
     file_texts = split_and_process_text(preprocessed_text, lang)
     
     file_metadatas = [{"source": f"{i}-{file.name}", "lang": lang} for i in range(len(file_texts))]
@@ -63,17 +48,27 @@ async def on_chat_start():
     files = None
     while files is None:
         files = await cl.AskFileMessage(
-            content="Please upload one or more pdf files to begin!",
-            accept=["application/pdf"],
+            content="Please upload one or more files to begin!",
+            accept=[
+                "application/pdf",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/msword",
+                "text/plain",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "application/vnd.ms-excel",
+                "text/csv",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "application/vnd.ms-powerpoint"
+            ],
             max_size_mb=500,
             max_files=10,
             timeout=180,
         ).send()
     
-    msg = cl.Message(content=f"Processing {len(files)} files... This may take a while for large or complex PDFs.")
+    msg = cl.Message(content=f"Processing {len(files)} files... This may take a while for large or complex files.")
     await msg.send()
 
-    results = await asyncio.gather(*[process_pdf(file) for file in files])
+    results = await asyncio.gather(*[process_file(file) for file in files])
     texts = []
     metadatas = []
     for file_texts, file_metadatas in results:
@@ -121,6 +116,6 @@ async def main(message: cl.Message):
             answer += f"\nSources: {', '.join(source_names)}" if source_names else "\nNo sources found"
         await cl.Message(content=answer, elements=text_elements).send()
     except asyncio.TimeoutError:
-        await cl.Message(content="I'm sorry, but the request timed out. The PDF might be too large or complex to process quickly. Could you try asking about a specific part of the document?").send()
+        await cl.Message(content="I'm sorry, but the request timed out. The file might be too large or complex to process quickly. Could you try asking about a specific part of the document?").send()
     except Exception as e:
         await cl.Message(content=f"An error occurred: {str(e)}. Please try again or contact support if the problem persists.").send()
